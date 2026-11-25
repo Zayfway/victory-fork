@@ -197,7 +197,7 @@ pub(crate) struct Detached {
 impl Detached {
     /// A closed list of ours, to run among a title's.
     pub(crate) fn ours(host: crate::host::HostList) -> Self {
-        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+        Detached { host, _uploads: Uploads::default(), _state: Default::default() }
     }
 
     pub(crate) fn host(&self) -> &crate::host::HostList {

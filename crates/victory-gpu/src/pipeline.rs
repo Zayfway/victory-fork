@@ -236,6 +236,9 @@ impl Shader {
                     #[cfg(feature = "diagnostics")]
                     loop_slot: OnceLock::new(),
                     thread_limited: true,
+                    // The thread-limited twin is the same program: what it
+                    // resolves is what the original resolves.
+                    resolves_light: self.resolves_light,
                     limited_twin: OnceLock::new(),
                     group: OnceLock::new(),
                     walks: OnceLock::new(),
