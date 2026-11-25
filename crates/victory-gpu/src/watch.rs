@@ -737,6 +737,11 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// With [`absent_cache`]: for an absent block, the end of the run of
+    /// uncommitted blocks Windows answered for it ([`uncommitted_end`]),
+    /// and when. Forgotten for a range the runtime maps, unmaps or commits
+    /// ([`forget_absent_ends`]), and after [`ABSENT_FRESH`].
+    absent_ends: BTreeMap<usize, (usize, std::time::Instant)>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -786,6 +791,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    absent_ends: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -857,7 +863,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // Ordinary commits need no runtime mapping notification. Reuse
                 // this asking's query for the following blocks in the same region.
                 if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
+                    uncommitted_until = cached_uncommitted_end(&mut g, block);
                 }
                 open = block >= uncommitted_until;
                 if open {
@@ -1107,6 +1113,73 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
+/// Whether [`guard`] keeps what Windows answered about runs of uncommitted
+/// blocks (`VICTORY_ABSENT_CACHE=1`; off by default).
+///
+/// A block noted absent (copied as zeros, not committed) is asked about
+/// again at every check of a range over it: `uncommitted_end` walks the
+/// page tables, under the guards' lock. In the Series S prison scene that
+/// was 12.3 ms a frame of the submitting thread's 113, nearly all of it for
+/// the same runs frame after frame. With the switch the answer is kept per
+/// block until the runtime maps, unmaps or commits memory over its run
+/// ([`title_memory_remapped`], [`title_memory_committed`]) or for
+/// [`ABSENT_FRESH`] at most: a block the title commits through a path the
+/// runtime does not see is found by then.
+fn absent_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// How long [`absent_cache`] trusts an answer the runtime did not undo.
+const ABSENT_FRESH: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// [`uncommitted_end`], through [`absent_cache`].
+fn cached_uncommitted_end(g: &mut Guards, block: usize) -> usize {
+    if !absent_cache() {
+        return uncommitted_end(block);
+    }
+    let now = std::time::Instant::now();
+    if let Some(&(until, when)) = g.absent_ends.get(&block)
+        && now.duration_since(when) < ABSENT_FRESH
+    {
+        return until;
+    }
+    let until = uncommitted_end(block);
+    if until > block {
+        g.absent_ends.insert(block, (until, now));
+    } else {
+        g.absent_ends.remove(&block);
+    }
+    until
+}
+
+/// Forgets what [`absent_cache`] keeps about runs that reach into blocks
+/// `[from, to)`.
+fn forget_absent_ends(g: &mut Guards, from: usize, to: usize) {
+    if g.absent_ends.is_empty() {
+        return;
+    }
+    let stale: Vec<usize> = g
+        .absent_ends
+        .range(..to)
+        .filter(|&(_, &(until, _))| until > from)
+        .map(|(&block, _)| block)
+        .collect();
+    for block in stale {
+        g.absent_ends.remove(&block);
+    }
+}
+
+/// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`):
+/// what [`absent_cache`] kept about runs there is no longer true.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if !absent_cache() || len == 0 {
+        return;
+    }
+    let mut g = guards();
+    forget_absent_ends(&mut g, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+}
+
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded. The same physical pages at
 /// every other view of them are opened too: the write that faulted (or is
@@ -1343,6 +1416,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let (r_from, r_to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    forget_absent_ends(&mut g, r_from, r_to);
     let absent: Vec<usize> = g.absent.range(r_from..r_to).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -1435,6 +1509,35 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// What `absent_cache` keeps is forgotten for exactly the runs that reach
+    /// into a range the runtime maps, unmaps or commits: a run that ends at
+    /// the range's start, or starts at its end, stays.
+    #[test]
+    fn absent_ends_are_forgotten_for_runs_reaching_into_a_changed_range() {
+        let now = std::time::Instant::now();
+        let mut g = Guards {
+            protected: BlockRuns::new(),
+            clean: BlockRuns::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            absent_ends: BTreeMap::new(),
+        };
+        // Runs [10, 20), [20, 25), [30, 40), [50, 60).
+        for (block, until) in [(10, 20), (20, 25), (30, 40), (50, 60)] {
+            g.absent_ends.insert(block, (until, now));
+        }
+        // A change over blocks [24, 31) reaches the second and third runs.
+        forget_absent_ends(&mut g, 24, 31);
+        assert_eq!(g.absent_ends.keys().copied().collect::<Vec<_>>(), [10, 50]);
+        // One that touches no run forgets nothing.
+        forget_absent_ends(&mut g, 20, 50);
+        assert_eq!(g.absent_ends.keys().copied().collect::<Vec<_>>(), [10, 50]);
+        // A run that starts before the range and reaches into it goes.
+        forget_absent_ends(&mut g, 19, 20);
+        assert_eq!(g.absent_ends.keys().copied().collect::<Vec<_>>(), [50]);
+    }
 
     /// The interval set the guards keep their protected and clean blocks in:
     /// adjacent inserts coalesce, a removal splits, and the queries answer
