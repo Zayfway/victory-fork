@@ -955,7 +955,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
-                if alias != block && !g.protected.contains(&alias) {
+                if alias != block && !g.protected.contains(alias) {
                     alias_blocks.push(alias);
                 }
             }
@@ -988,7 +988,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             )
         };
         if set != 0 {
-            g.protected.extend(run_start..run_end);
+            g.protected.insert_range(run_start, run_end);
             if view_known() {
                 g.viewed.extend(run_start..run_end);
             }
